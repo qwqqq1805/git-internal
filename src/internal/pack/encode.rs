@@ -259,6 +259,64 @@ fn cheap_similar(a: &[u8], b: &[u8]) -> bool {
     calc_hash(&a[..k]) == calc_hash(&b[..k])
 }
 
+struct DeltaBase {
+    obj_type: ObjectType,
+    data: Vec<u8>,
+    hash: ObjectHash,
+    chain_len: usize,
+    offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DeltaCandidate {
+    index: usize,
+    rate: f64,
+    chain_len: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DeltaEncodeStats {
+    object_count: usize,
+    delta_count: usize,
+    candidate_count: usize,
+    chain_len_sum: usize,
+}
+
+impl DeltaEncodeStats {
+    fn average_chain_len(&self) -> f64 {
+        if self.delta_count == 0 {
+            0.0
+        } else {
+            self.chain_len_sum as f64 / self.delta_count as f64
+        }
+    }
+}
+
+fn choose_delta_candidate(
+    current: Option<DeltaCandidate>,
+    candidate: DeltaCandidate,
+    tie_epsilon: f64,
+) -> Option<DeltaCandidate> {
+    match current {
+        None => Some(candidate),
+        Some(best) => {
+            let is_better = if candidate.rate > best.rate + tie_epsilon {
+                true
+            } else if (candidate.rate - best.rate).abs() <= tie_epsilon {
+                candidate.chain_len > best.chain_len
+            } else {
+                false
+            };
+
+            if is_better {
+                Some(candidate)
+            } else {
+                Some(best)
+            }
+        }
+    }
+}
+
 impl PackEncoder {
     pub fn new(object_number: usize, window_size: usize, sender: mpsc::Sender<Vec<u8>>) -> Self {
         PackEncoder {
@@ -398,6 +456,7 @@ impl PackEncoder {
         );
 
         // parallel encoding vec with different object_type
+        let window_size = self.window_size;
         let (commit_results, tree_results, blob_results, tag_results) = tokio::try_join!(
             tokio::task::spawn_blocking(move || {
                 Self::try_as_offset_delta(
@@ -405,7 +464,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -415,7 +474,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -425,7 +484,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -434,7 +493,7 @@ impl PackEncoder {
                     tags.into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    10,
+                    window_size,
                     enable_zstdelta,
                 )
             }),
@@ -446,14 +505,14 @@ impl PackEncoder {
         let blob_res = blob_results?;
         let tag_res = tag_results?;
 
-        let mut all_res = vec![commit_res, tree_res, blob_res, tag_res];
+        let all_res = vec![commit_res, tree_res, blob_res, tag_res];
 
         let mut idx_entries = Vec::new();
-        for res in &mut all_res {
-            for data in res {
-                data.1.offset = self.inner_offset as u64;
-                self.write_all_and_update(&data.0).await;
-                idx_entries.push(data.1.clone());
+        for res in all_res {
+            for (data, mut idx_entry) in res {
+                idx_entry.offset = self.inner_offset as u64;
+                self.write_vec_and_update(data).await;
+                idx_entries.push(idx_entry);
             }
         }
 
@@ -476,118 +535,149 @@ impl PackEncoder {
     /// - Return (Vec<Vec<u8>) if success make delta
     /// - Return (None) if didn't delta,
     fn try_as_offset_delta(
-        mut bucket: Vec<Entry>,
+        bucket: Vec<Entry>,
         window_size: usize,
         enable_zstdelta: bool,
     ) -> Result<Vec<(Vec<u8>, IndexEntry)>, GitError> {
+        let (encoded, stats) =
+            Self::try_as_offset_delta_with_stats(bucket, window_size, enable_zstdelta)?;
+        tracing::info!(
+            "delta encode stats: objects={} deltas={} candidate_bases={} avg_chain_len={:.2}",
+            stats.object_count,
+            stats.delta_count,
+            stats.candidate_count,
+            stats.average_chain_len()
+        );
+        Ok(encoded)
+    }
+
+    fn try_as_offset_delta_with_stats(
+        bucket: Vec<Entry>,
+        window_size: usize,
+        enable_zstdelta: bool,
+    ) -> Result<(Vec<(Vec<u8>, IndexEntry)>, DeltaEncodeStats), GitError> {
         let mut current_offset = 0usize;
-        let mut window: VecDeque<(Entry, usize)> = VecDeque::with_capacity(window_size);
-        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
+        let mut window: VecDeque<DeltaBase> = VecDeque::with_capacity(window_size);
+        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
+        let mut stats = DeltaEncodeStats::default();
         //let mut idx_entries: Vec<IndexEntry> = Vec::new();
 
-        for entry in bucket.iter_mut() {
+        for mut entry in bucket {
             //let entry_for_window = entry.clone();
             // 每次循环重置最佳基对象选择
-            let mut best_base: Option<&(Entry, usize)> = None;
-            let mut best_rate: f64 = 0.0;
             let tie_epsilon: f64 = 0.15;
+            let original_obj_type = entry.obj_type;
+            let original_hash = entry.hash;
+            let original_data = std::mem::take(&mut entry.data);
 
-            let candidates: Vec<_> = window
+            let (best_candidate, candidate_count) = window
                 .par_iter()
+                .enumerate()
                 .with_min_len(3)
-                .filter_map(|try_base| {
-                    if try_base.0.obj_type != entry.obj_type {
-                        return None;
-                    }
+                .fold(
+                    || (None, 0usize),
+                    |(best, candidate_count), (index, try_base)| {
+                        if try_base.obj_type != original_obj_type {
+                            return (best, candidate_count);
+                        }
 
-                    if try_base.0.chain_len >= MAX_CHAIN_LEN {
-                        return None;
-                    }
+                        if try_base.chain_len >= MAX_CHAIN_LEN {
+                            return (best, candidate_count);
+                        }
 
-                    if try_base.0.hash == entry.hash {
-                        return None;
-                    }
+                        if try_base.hash == original_hash {
+                            return (best, candidate_count);
+                        }
 
-                    let sym_ratio = (try_base.0.data.len().min(entry.data.len()) as f64)
-                        / (try_base.0.data.len().max(entry.data.len()) as f64);
-                    if sym_ratio < 0.5 {
-                        return None;
-                    }
+                        let sym_ratio = (try_base.data.len().min(original_data.len()) as f64)
+                            / (try_base.data.len().max(original_data.len()) as f64);
+                        if sym_ratio < 0.5 {
+                            return (best, candidate_count);
+                        }
 
-                    if !cheap_similar(&try_base.0.data, &entry.data) {
-                        return None;
-                    }
+                        if !cheap_similar(&try_base.data, &original_data) {
+                            return (best, candidate_count);
+                        }
 
-                    let rate = if (try_base.0.data.len() + entry.data.len()) / 2 > 64 {
-                        delta::heuristic_encode_rate_parallel(&try_base.0.data, &entry.data)
-                    } else {
-                        delta::encode_rate(&try_base.0.data, &entry.data)
-                        // let try_delta_obj = zstdelta::diff(&try_base.0.data, &entry.data).unwrap();
-                        // 1.0 - try_delta_obj.len() as f64 / entry.data.len() as f64
-                    };
-
-                    if rate > MIN_DELTA_RATE {
-                        Some((rate, try_base))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            for (rate, try_base) in candidates {
-                match best_base {
-                    None => {
-                        best_rate = rate;
-                        //best_base_offset = current_offset - try_base.1;
-                        best_base = Some(try_base);
-                    }
-                    Some(best_base_ref) => {
-                        let is_better = if rate > best_rate + tie_epsilon {
-                            true
-                        } else if (rate - best_rate).abs() <= tie_epsilon {
-                            try_base.0.chain_len > best_base_ref.0.chain_len
+                        let rate = if (try_base.data.len() + original_data.len()) / 2 > 64 {
+                            delta::heuristic_encode_rate_parallel(&try_base.data, &original_data)
                         } else {
-                            false
+                            delta::encode_rate(&try_base.data, &original_data)
                         };
 
-                        if is_better {
-                            best_rate = rate;
-                            best_base = Some(try_base);
+                        if rate > MIN_DELTA_RATE {
+                            let candidate = DeltaCandidate {
+                                index,
+                                rate,
+                                chain_len: try_base.chain_len,
+                            };
+                            (
+                                choose_delta_candidate(best, candidate, tie_epsilon),
+                                candidate_count + 1,
+                            )
+                        } else {
+                            (best, candidate_count)
                         }
-                    }
-                }
-            }
+                    },
+                )
+                .reduce(
+                    || (None, 0usize),
+                    |(left_best, left_count), (right_best, right_count)| {
+                        let best = match (left_best, right_best) {
+                            (None, None) => None,
+                            (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
+                            (Some(left), Some(right)) => {
+                                choose_delta_candidate(Some(left), right, tie_epsilon)
+                            }
+                        };
+                        (best, left_count + right_count)
+                    },
+                );
 
-            let mut entry_for_window = entry.clone();
+            stats.object_count += 1;
+            stats.candidate_count += candidate_count;
 
-            let offset = best_base.map(|best_base| {
+            let mut window_data = None;
+            let offset = if let Some(best_candidate) = best_candidate {
+                let best_base = &window[best_candidate.index];
                 let delta = if enable_zstdelta {
                     entry.obj_type = ObjectType::OffsetZstdelta;
-                    zstdelta::diff(&best_base.0.data, &entry.data)
-                        .map_err(|e| {
-                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                        })
-                        .unwrap()
+                    zstdelta::diff(&best_base.data, &original_data).map_err(|e| {
+                        GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                    })?
                 } else {
                     entry.obj_type = ObjectType::OffsetDelta;
-                    delta::encode(&best_base.0.data, &entry.data)
+                    delta::encode(&best_base.data, &original_data)
                 };
-                //entry.obj_type = ObjectType::OffsetDelta;
                 entry.data = delta;
-                entry.chain_len = best_base.0.chain_len + 1;
-                current_offset - best_base.1
-            });
+                entry.chain_len = best_base.chain_len + 1;
+                window_data = Some(original_data);
+                stats.delta_count += 1;
+                stats.chain_len_sum += entry.chain_len;
+                Some(current_offset - best_base.offset)
+            } else {
+                entry.data = original_data;
+                None
+            };
 
-            entry_for_window.chain_len = entry.chain_len;
-            let obj_data = encode_one_object(entry, offset)?;
-            window.push_back((entry_for_window, current_offset));
+            let obj_data = encode_one_object(&entry, offset)?;
+            let index_entry = IndexEntry::new(&entry, 0);
+            let base_data = window_data.unwrap_or_else(|| std::mem::take(&mut entry.data));
+            window.push_back(DeltaBase {
+                obj_type: original_obj_type,
+                data: base_data,
+                hash: original_hash,
+                chain_len: entry.chain_len,
+                offset: current_offset,
+            });
             if window.len() > window_size {
                 window.pop_front();
             }
-            res.push((obj_data.clone(), IndexEntry::new(entry, 0)));
-            current_offset += obj_data.len();
+            let obj_len = obj_data.len();
+            res.push((obj_data, index_entry));
+            current_offset += obj_len;
         }
-        Ok(res)
+        Ok((res, stats))
     }
 
     /// Parallel encode with rayon, only works when window_size == 0 (no delta)
@@ -653,10 +743,10 @@ impl PackEncoder {
 
             time_it!("parallel encode: write batch", {
                 for obj_data in batch_result {
-                    let mut obj_data = obj_data?;
-                    obj_data.1.offset = self.inner_offset as u64;
-                    self.write_all_and_update(&obj_data.0).await;
-                    idx_entries.push(obj_data.1);
+                    let (data, mut idx_entry) = obj_data?;
+                    idx_entry.offset = self.inner_offset as u64;
+                    self.write_vec_and_update(data).await;
+                    idx_entries.push(idx_entry);
                 }
             });
         }
@@ -680,16 +770,16 @@ impl PackEncoder {
     }
 
     /// Write data to writer and update hash & offset
-    async fn write_all_and_update(&mut self, data: &[u8]) {
-        self.inner_hash.update(data);
+    async fn write_vec_and_update(&mut self, data: Vec<u8>) {
+        self.inner_hash.update(&data);
         self.inner_offset += data.len();
-        self.send_data(data.to_vec()).await;
+        self.send_data(data).await;
     }
 
     async fn generate_idx_file(&mut self) -> Result<(), GitError> {
         let final_hash = self.final_hash
             .ok_or(GitError::PackEncodeError("final_hash is missing,The pack file must be generated before the index file is produced.".into()))?;
-        let idx_entries = self.idx_entries.clone().ok_or(GitError::PackEncodeError(
+        let idx_entries = self.idx_entries.take().ok_or(GitError::PackEncodeError(
             "The pack file must be generated before the index file is produced.".into(),
         ))?;
         let mut idx_builder = IdxBuilder::new(
@@ -924,6 +1014,53 @@ mod tests {
             .await
             .expect_err("must reject AI pack type");
         assert!(matches!(err, GitError::PackEncodeError(_)));
+    }
+
+    #[test]
+    fn test_try_as_offset_delta_respects_window_size() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+
+        fn entry_from_data(data: Vec<u8>) -> Entry {
+            Entry {
+                obj_type: ObjectType::Blob,
+                hash: ObjectHash::new(&data),
+                data,
+                chain_len: 0,
+            }
+        }
+
+        let base = vec![b'a'; 256];
+        let unrelated = vec![b'b'; 256];
+        let mut similar_to_base = base.clone();
+        similar_to_base[200] = b'c';
+
+        let entries = vec![
+            entry_from_data(base),
+            entry_from_data(unrelated),
+            entry_from_data(similar_to_base),
+        ];
+
+        let (_, window_1_stats) =
+            PackEncoder::try_as_offset_delta_with_stats(entries.clone(), 1, false)
+                .expect("window_size=1 should encode");
+        let (_, window_10_stats) = PackEncoder::try_as_offset_delta_with_stats(entries, 10, false)
+            .expect("window_size=10 should encode");
+
+        assert_eq!(window_1_stats.object_count, 3);
+        assert_eq!(window_10_stats.object_count, 3);
+        assert_eq!(
+            window_1_stats.delta_count, 0,
+            "window_size=1 only sees the unrelated immediate predecessor"
+        );
+        assert_eq!(
+            window_10_stats.delta_count, 1,
+            "window_size=10 can still see the older similar base"
+        );
+        assert!(
+            window_10_stats.candidate_count > window_1_stats.candidate_count,
+            "larger windows should expose more eligible base candidates"
+        );
+        assert_eq!(window_10_stats.average_chain_len(), 1.0);
     }
 
     async fn get_entries_for_test() -> (Arc<Mutex<Vec<Entry>>>, PackFileGuard) {
