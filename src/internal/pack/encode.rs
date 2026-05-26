@@ -259,14 +259,6 @@ fn cheap_similar(a: &[u8], b: &[u8]) -> bool {
     calc_hash(&a[..k]) == calc_hash(&b[..k])
 }
 
-struct DeltaBase {
-    obj_type: ObjectType,
-    data: Vec<u8>,
-    hash: ObjectHash,
-    chain_len: usize,
-    offset: usize,
-}
-
 #[derive(Clone, Copy)]
 struct DeltaCandidate {
     index: usize,
@@ -315,6 +307,80 @@ fn choose_delta_candidate(
             }
         }
     }
+}
+
+fn delta_candidate_for_base(
+    index: usize,
+    try_base: &(Entry, usize),
+    entry: &Entry,
+) -> Option<DeltaCandidate> {
+    if try_base.0.obj_type != entry.obj_type {
+        return None;
+    }
+
+    if try_base.0.chain_len >= MAX_CHAIN_LEN {
+        return None;
+    }
+
+    if try_base.0.hash == entry.hash {
+        return None;
+    }
+
+    let sym_ratio = (try_base.0.data.len().min(entry.data.len()) as f64)
+        / (try_base.0.data.len().max(entry.data.len()) as f64);
+    if sym_ratio < 0.5 {
+        return None;
+    }
+
+    if !cheap_similar(&try_base.0.data, &entry.data) {
+        return None;
+    }
+
+    let rate = if (try_base.0.data.len() + entry.data.len()) / 2 > 64 {
+        delta::heuristic_encode_rate_parallel(&try_base.0.data, &entry.data)
+    } else {
+        delta::encode_rate(&try_base.0.data, &entry.data)
+    };
+
+    if rate > MIN_DELTA_RATE {
+        Some(DeltaCandidate {
+            index,
+            rate,
+            chain_len: try_base.0.chain_len,
+        })
+    } else {
+        None
+    }
+}
+
+fn collect_delta_candidates<'a>(
+    window: &'a VecDeque<(Entry, usize)>,
+    entry: &Entry,
+) -> Vec<(DeltaCandidate, &'a (Entry, usize))> {
+    window
+        .par_iter()
+        .enumerate()
+        .with_min_len(3)
+        .filter_map(|(index, try_base)| {
+            delta_candidate_for_base(index, try_base, entry).map(|candidate| (candidate, try_base))
+        })
+        .collect()
+}
+
+fn select_best_delta_base<'a>(
+    candidates: &'a [(DeltaCandidate, &'a (Entry, usize))],
+    tie_epsilon: f64,
+) -> Option<&'a (Entry, usize)> {
+    let best_candidate = candidates.iter().fold(None, |best, (candidate, _)| {
+        choose_delta_candidate(best, *candidate, tie_epsilon)
+    });
+
+    best_candidate.and_then(|candidate| {
+        candidates
+            .iter()
+            .find(|(stored, _)| stored.index == candidate.index)
+            .map(|(_, try_base)| *try_base)
+    })
 }
 
 impl PackEncoder {
@@ -456,7 +522,6 @@ impl PackEncoder {
         );
 
         // parallel encoding vec with different object_type
-        let window_size = self.window_size;
         let (commit_results, tree_results, blob_results, tag_results) = tokio::try_join!(
             tokio::task::spawn_blocking(move || {
                 Self::try_as_offset_delta(
@@ -464,7 +529,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    window_size,
+                    10,
                     enable_zstdelta,
                 )
             }),
@@ -474,7 +539,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    window_size,
+                    10,
                     enable_zstdelta,
                 )
             }),
@@ -484,7 +549,7 @@ impl PackEncoder {
                         .into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    window_size,
+                    10,
                     enable_zstdelta,
                 )
             }),
@@ -493,7 +558,7 @@ impl PackEncoder {
                     tags.into_iter()
                         .map(|entry_with_meta| entry_with_meta.inner)
                         .collect(),
-                    window_size,
+                    10,
                     enable_zstdelta,
                 )
             }),
@@ -505,14 +570,14 @@ impl PackEncoder {
         let blob_res = blob_results?;
         let tag_res = tag_results?;
 
-        let all_res = vec![commit_res, tree_res, blob_res, tag_res];
+        let mut all_res = vec![commit_res, tree_res, blob_res, tag_res];
 
         let mut idx_entries = Vec::new();
-        for res in all_res {
-            for (data, mut idx_entry) in res {
-                idx_entry.offset = self.inner_offset as u64;
-                self.write_vec_and_update(data).await;
-                idx_entries.push(idx_entry);
+        for res in &mut all_res {
+            for data in res {
+                data.1.offset = self.inner_offset as u64;
+                self.write_all_and_update(&data.0).await;
+                idx_entries.push(data.1.clone());
             }
         }
 
@@ -557,125 +622,52 @@ impl PackEncoder {
         enable_zstdelta: bool,
     ) -> Result<(Vec<(Vec<u8>, IndexEntry)>, DeltaEncodeStats), GitError> {
         let mut current_offset = 0usize;
-        let mut window: VecDeque<DeltaBase> = VecDeque::with_capacity(window_size);
-        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::with_capacity(bucket.len());
+        let mut bucket = bucket;
+        let mut window: VecDeque<(Entry, usize)> = VecDeque::with_capacity(window_size);
+        let mut res: Vec<(Vec<u8>, IndexEntry)> = Vec::new();
         let mut stats = DeltaEncodeStats::default();
         //let mut idx_entries: Vec<IndexEntry> = Vec::new();
 
-        for mut entry in bucket {
+        for entry in bucket.iter_mut() {
             //let entry_for_window = entry.clone();
             // 每次循环重置最佳基对象选择
             let tie_epsilon: f64 = 0.15;
-            let original_obj_type = entry.obj_type;
-            let original_hash = entry.hash;
-            let original_data = std::mem::take(&mut entry.data);
-
-            let (best_candidate, candidate_count) = window
-                .par_iter()
-                .enumerate()
-                .with_min_len(3)
-                .fold(
-                    || (None, 0usize),
-                    |(best, candidate_count), (index, try_base)| {
-                        if try_base.obj_type != original_obj_type {
-                            return (best, candidate_count);
-                        }
-
-                        if try_base.chain_len >= MAX_CHAIN_LEN {
-                            return (best, candidate_count);
-                        }
-
-                        if try_base.hash == original_hash {
-                            return (best, candidate_count);
-                        }
-
-                        let sym_ratio = (try_base.data.len().min(original_data.len()) as f64)
-                            / (try_base.data.len().max(original_data.len()) as f64);
-                        if sym_ratio < 0.5 {
-                            return (best, candidate_count);
-                        }
-
-                        if !cheap_similar(&try_base.data, &original_data) {
-                            return (best, candidate_count);
-                        }
-
-                        let rate = if (try_base.data.len() + original_data.len()) / 2 > 64 {
-                            delta::heuristic_encode_rate_parallel(&try_base.data, &original_data)
-                        } else {
-                            delta::encode_rate(&try_base.data, &original_data)
-                        };
-
-                        if rate > MIN_DELTA_RATE {
-                            let candidate = DeltaCandidate {
-                                index,
-                                rate,
-                                chain_len: try_base.chain_len,
-                            };
-                            (
-                                choose_delta_candidate(best, candidate, tie_epsilon),
-                                candidate_count + 1,
-                            )
-                        } else {
-                            (best, candidate_count)
-                        }
-                    },
-                )
-                .reduce(
-                    || (None, 0usize),
-                    |(left_best, left_count), (right_best, right_count)| {
-                        let best = match (left_best, right_best) {
-                            (None, None) => None,
-                            (Some(candidate), None) | (None, Some(candidate)) => Some(candidate),
-                            (Some(left), Some(right)) => {
-                                choose_delta_candidate(Some(left), right, tie_epsilon)
-                            }
-                        };
-                        (best, left_count + right_count)
-                    },
-                );
+            let candidates = collect_delta_candidates(&window, entry);
 
             stats.object_count += 1;
-            stats.candidate_count += candidate_count;
+            stats.candidate_count += candidates.len();
 
-            let mut window_data = None;
-            let offset = if let Some(best_candidate) = best_candidate {
-                let best_base = &window[best_candidate.index];
+            let best_base = select_best_delta_base(&candidates, tie_epsilon);
+
+            let mut entry_for_window = entry.clone();
+
+            let offset = best_base.map(|best_base| {
                 let delta = if enable_zstdelta {
                     entry.obj_type = ObjectType::OffsetZstdelta;
-                    zstdelta::diff(&best_base.data, &original_data).map_err(|e| {
-                        GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
-                    })?
+                    zstdelta::diff(&best_base.0.data, &entry.data)
+                        .map_err(|e| {
+                            GitError::DeltaObjectError(format!("zstdelta diff failed: {e}"))
+                        })
+                        .unwrap()
                 } else {
                     entry.obj_type = ObjectType::OffsetDelta;
-                    delta::encode(&best_base.data, &original_data)
+                    delta::encode(&best_base.0.data, &entry.data)
                 };
                 entry.data = delta;
-                entry.chain_len = best_base.chain_len + 1;
-                window_data = Some(original_data);
+                entry.chain_len = best_base.0.chain_len + 1;
                 stats.delta_count += 1;
                 stats.chain_len_sum += entry.chain_len;
-                Some(current_offset - best_base.offset)
-            } else {
-                entry.data = original_data;
-                None
-            };
-
-            let obj_data = encode_one_object(&entry, offset)?;
-            let index_entry = IndexEntry::new(&entry, 0);
-            let base_data = window_data.unwrap_or_else(|| std::mem::take(&mut entry.data));
-            window.push_back(DeltaBase {
-                obj_type: original_obj_type,
-                data: base_data,
-                hash: original_hash,
-                chain_len: entry.chain_len,
-                offset: current_offset,
+                current_offset - best_base.1
             });
+
+            entry_for_window.chain_len = entry.chain_len;
+            let obj_data = encode_one_object(entry, offset)?;
+            window.push_back((entry_for_window, current_offset));
             if window.len() > window_size {
                 window.pop_front();
             }
-            let obj_len = obj_data.len();
-            res.push((obj_data, index_entry));
-            current_offset += obj_len;
+            res.push((obj_data.clone(), IndexEntry::new(entry, 0)));
+            current_offset += obj_data.len();
         }
         Ok((res, stats))
     }
@@ -743,10 +735,10 @@ impl PackEncoder {
 
             time_it!("parallel encode: write batch", {
                 for obj_data in batch_result {
-                    let (data, mut idx_entry) = obj_data?;
-                    idx_entry.offset = self.inner_offset as u64;
-                    self.write_vec_and_update(data).await;
-                    idx_entries.push(idx_entry);
+                    let mut obj_data = obj_data?;
+                    obj_data.1.offset = self.inner_offset as u64;
+                    self.write_all_and_update(&obj_data.0).await;
+                    idx_entries.push(obj_data.1);
                 }
             });
         }
@@ -770,16 +762,16 @@ impl PackEncoder {
     }
 
     /// Write data to writer and update hash & offset
-    async fn write_vec_and_update(&mut self, data: Vec<u8>) {
-        self.inner_hash.update(&data);
+    async fn write_all_and_update(&mut self, data: &[u8]) {
+        self.inner_hash.update(data);
         self.inner_offset += data.len();
-        self.send_data(data).await;
+        self.send_data(data.to_vec()).await;
     }
 
     async fn generate_idx_file(&mut self) -> Result<(), GitError> {
         let final_hash = self.final_hash
             .ok_or(GitError::PackEncodeError("final_hash is missing,The pack file must be generated before the index file is produced.".into()))?;
-        let idx_entries = self.idx_entries.take().ok_or(GitError::PackEncodeError(
+        let idx_entries = self.idx_entries.clone().ok_or(GitError::PackEncodeError(
             "The pack file must be generated before the index file is produced.".into(),
         ))?;
         let mut idx_builder = IdxBuilder::new(
@@ -1014,6 +1006,109 @@ mod tests {
             .await
             .expect_err("must reject AI pack type");
         assert!(matches!(err, GitError::PackEncodeError(_)));
+    }
+
+    #[test]
+    fn test_choose_delta_candidate_prefers_higher_rate() {
+        let current = DeltaCandidate {
+            index: 1,
+            rate: 0.60,
+            chain_len: 1,
+        };
+        let candidate = DeltaCandidate {
+            index: 2,
+            rate: 0.80,
+            chain_len: 1,
+        };
+
+        let best = choose_delta_candidate(Some(current), candidate, 0.15)
+            .expect("a best candidate should be selected");
+
+        assert_eq!(best.index, 2);
+        assert_eq!(best.rate, 0.80);
+        assert_eq!(best.chain_len, 1);
+    }
+
+    #[test]
+    fn test_choose_delta_candidate_uses_chain_len_tie_breaker() {
+        let current = DeltaCandidate {
+            index: 1,
+            rate: 0.72,
+            chain_len: 1,
+        };
+        let candidate = DeltaCandidate {
+            index: 2,
+            rate: 0.80,
+            chain_len: 3,
+        };
+
+        let best = choose_delta_candidate(Some(current), candidate, 0.15)
+            .expect("a best candidate should be selected");
+
+        assert_eq!(best.index, 2);
+        assert_eq!(best.rate, 0.80);
+        assert_eq!(best.chain_len, 3);
+    }
+
+    #[test]
+    fn test_delta_candidate_for_base_accepts_similar_object() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+
+        let base_data = vec![b'a'; 256];
+        let mut entry_data = base_data.clone();
+        entry_data[200] = b'c';
+
+        let base = Entry {
+            obj_type: ObjectType::Blob,
+            hash: ObjectHash::new(&base_data),
+            data: base_data,
+            chain_len: 2,
+        };
+        let entry = Entry {
+            obj_type: ObjectType::Blob,
+            hash: ObjectHash::new(&entry_data),
+            data: entry_data,
+            chain_len: 0,
+        };
+
+        let candidate = delta_candidate_for_base(7, &(base, 0), &entry)
+            .expect("similar objects should produce a delta candidate");
+
+        assert_eq!(candidate.index, 7);
+        assert!(candidate.rate > MIN_DELTA_RATE);
+        assert_eq!(candidate.chain_len, 2);
+    }
+
+    #[test]
+    fn test_collect_delta_candidates_and_select_best_base() {
+        let _guard = set_hash_kind_for_test(HashKind::Sha1);
+
+        fn blob_entry(data: Vec<u8>, chain_len: usize) -> Entry {
+            Entry {
+                obj_type: ObjectType::Blob,
+                hash: ObjectHash::new(&data),
+                data,
+                chain_len,
+            }
+        }
+
+        let base_data = vec![b'a'; 256];
+        let unrelated_data = vec![b'b'; 256];
+        let mut entry_data = base_data.clone();
+        entry_data[220] = b'c';
+
+        let mut window = VecDeque::new();
+        window.push_back((blob_entry(base_data, 2), 0));
+        window.push_back((blob_entry(unrelated_data, 0), 100));
+
+        let entry = blob_entry(entry_data, 0);
+        let candidates = collect_delta_candidates(&window, &entry);
+        let best_base = select_best_delta_base(&candidates, 0.15)
+            .expect("similar base should be selected from the window");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(best_base.1, 0);
+        assert_eq!(best_base.0.chain_len, 2);
     }
 
     #[test]
